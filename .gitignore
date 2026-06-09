@@ -1,0 +1,22 @@
+# Local secrets and machine-specific settings.
+.env
+.env.*
+!.env.example
+
+# Local Compose overrides often contain host IPs or private paths.
+docker-compose.override.yml
+docker-compose.override.yaml
+compose.override.yml
+compose.override.yaml
+
+# i2pd runtime state. This includes router identity keys, netDb, addressbook,
+# peer profiles, destinations, pid files, and local config.
+i2pd/*
+!i2pd/
+!i2pd/.gitkeep
+
+# Editor and OS noise.
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
