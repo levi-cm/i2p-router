@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate Compose and private paths
+        env:
+          I2PD_HTTP_PASS: ci-only-dummy-password
+        run: |
+          set -euo pipefail
+
+          for bind_ip in 127.0.0.1 192.0.2.10; do
+            output="$RUNNER_TEMP/compose-${bind_ip//./-}.json"
+            I2PD_BIND_IP="$bind_ip" docker compose --env-file /dev/null config --quiet
+            I2PD_BIND_IP="$bind_ip" docker compose --env-file /dev/null config --format json > "$output"
+            jq -e --arg bind_ip "$bind_ip" '
+              .services.i2pd.image == "purplei2p/i2pd:release-2.60.0@sha256:7e2485270d274d9eaaa6240f8aaeac155b3af79967f44d1ba474c242a3653adb"
+              and .services.i2pd.healthcheck.test[0] == "CMD-SHELL"
+              and (.services.i2pd.ports | length == 3)
+              and all(.services.i2pd.ports[]; .host_ip == $bind_ip)
+            ' "$output" >/dev/null
+          done
+
+          override="example.invalid/i2pd:reviewed@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          rendered=$(I2PD_BIND_IP=127.0.0.1 I2PD_IMAGE="$override" \
+            docker compose --env-file /dev/null config --format json)
+          test "$(jq -r '.services.i2pd.image' <<<"$rendered")" = "$override"
+
+          if env -u I2PD_HTTP_PASS I2PD_BIND_IP=127.0.0.1 \
+            docker compose --env-file /dev/null config --quiet \
+            2>"$RUNNER_TEMP/missing-password.err"; then
+            echo "Compose accepted an omitted I2PD_HTTP_PASS" >&2
+            exit 1
+          fi
+          grep -Fq "Set I2PD_HTTP_PASS" "$RUNNER_TEMP/missing-password.err"
+
+          while IFS= read -r private_path; do
+            git check-ignore --no-index -q "$private_path"
+          done <<'EOF'
+          .env
+          .env.local
+          i2pd/router.keys
+          i2pd/router.info
+          i2pd/i2pd.conf
+          i2pd/netDb/example
+          i2pd/peerProfiles/example
+          EOF
+
+          test "$(git ls-files i2pd)" = "i2pd/.gitkeep"
+          test "$(git ls-files .env '.env.*')" = ".env.example"
+          grep -Fxq '.env' .dockerignore
+          grep -Fxq 'i2pd/' .dockerignore

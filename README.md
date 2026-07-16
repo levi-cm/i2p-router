@@ -18,6 +18,10 @@ docker compose up -d
 docker compose ps
 ```
 
+The default image is pinned to i2pd `2.60.0` and its multi-platform digest.
+For a deliberate upgrade, set `I2PD_IMAGE` in `.env` to a reviewed
+`release-<version>@sha256:<digest>` reference.
+
 The services bind to `I2PD_BIND_IP`, which should be this host's LAN address:
 
 - Web console: `http://<server-lan-ip>:7070`
@@ -25,7 +29,9 @@ The services bind to `I2PD_BIND_IP`, which should be this host's LAN address:
 - SAM bridge: `<server-lan-ip>:7656`
 
 The web console uses HTTP basic auth. The username and password come from
-`I2PD_HTTP_USER` and `I2PD_HTTP_PASS` in your ignored `.env` file.
+`I2PD_HTTP_USER` and `I2PD_HTTP_PASS` in your ignored `.env` file. **Warning:**
+LAN Basic Auth uses plain HTTP; use only a trusted LAN, or access it through
+SSH or TLS.
 
 Give the router a few minutes after first startup to bootstrap into the I2P
 network before expecting `.i2p` sites to load reliably.
@@ -34,7 +40,8 @@ network before expecting `.i2p` sites to load reliably.
 
 In Firefox network proxy settings, choose manual proxy configuration:
 
-- HTTP Proxy: `127.0.0.1`
+- HTTP Proxy from a LAN client: `<server-lan-ip>`
+- HTTP Proxy on the same host or through SSH: `127.0.0.1`
 - Port: `4444`
 - Enable `Use this proxy for HTTPS too` if Firefox shows that option.
 
