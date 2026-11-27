@@ -65,12 +65,20 @@ fi
 for pair in "proxy=${I2PD_PROXY_BIND_IP:-}" "console=${I2PD_CONSOLE_BIND_IP:-}" "sam=${I2PD_SAM_BIND_IP:-}"; do
     name=${pair%%=*}
     addr=${pair#*=}
-    case "$addr" in
-        0.0.0.0 | :: | "[::]" | 0:0:0:0:0:0:0:0 | "[0:0:0:0:0:0:0:0]" | "*")
-            die "the $name port is published on $addr (all interfaces). Bind it to" \
-                "127.0.0.1 or one specific trusted address; Docker bypasses ufw."
-            ;;
+    # Every spelling of the unspecified address: 0.0.0.0, ::, [::0], 0::0,
+    # ::ffff:0.0.0.0 and so on are only zeros, colons and dots once brackets
+    # and the IPv4-mapped prefix are removed.
+    norm=$(printf '%s' "$addr" | tr -d '[]' | tr '[:upper:]' '[:lower:]')
+    norm=${norm#::ffff:}
+    case "$norm" in
+        "*") wildcard=1 ;;
+        "" | *[!0:.]*) wildcard= ;;
+        *) wildcard=1 ;;
     esac
+    if [ -n "$wildcard" ]; then
+        die "the $name port is published on $addr (all interfaces). Bind it to" \
+            "127.0.0.1 or one specific trusted address; Docker bypasses ufw."
+    fi
 done
 
 # --- Arguments ----------------------------------------------------------------
@@ -114,7 +122,8 @@ if [ -n "$share_set" ]; then
         [0-9] | [1-9][0-9] | 100) ;;
         *) die "--share must be an integer from 0 to 100 (got '$share')." ;;
     esac
-    # i2pd keeps accepting transit tunnels at share=0, it only throttles them.
+    # i2pd already refuses new transit tunnels at share=0; --notransit makes
+    # that explicit.
     if [ "$share" -eq 0 ]; then
         set -- "$@" --notransit
     fi

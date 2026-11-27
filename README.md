@@ -110,11 +110,18 @@ podman compose up -d
 | SAM bridge | 7656/tcp | `127.0.0.1` | `I2PD_SAM_BIND_IP` | none | Roughly shell-level. They can create destinations, and `STREAM FORWARD` makes the container connect to any host and port it can reach, including your LAN. |
 | SAM datagrams | 7655/udp | not published | none | none | Container-only. i2pd always opens it together with SAM. |
 | SOCKS 4447, BOB 2827, I2CP 7654, I2PControl 7650 | none | disabled | none | none | Not running. |
-| I2P transports (NTCP2, SSU2) | random | not published | none | none | Outbound only. The router runs firewalled, which is fine for client use. |
+| I2P transports (NTCP2, SSU2) | random | not published | none | none | No inbound port is forwarded. The router runs firewalled and other routers reach it only through SSU2 introducers, which is fine for client use. |
 
 i2pd listens on `0.0.0.0` inside the container because published ports
 arrive on the container's `eth0`. Exposure on the host is decided only by
 `ports:` in `docker-compose.yml`.
+
+Host applications reach SAM through Docker's port forwarding, so i2pd sees
+them as the bridge gateway address, not `127.0.0.1`. Use `STREAM ACCEPT`, or
+`STREAM FORWARD` with a `HOST=` the container can reach: without `HOST`, i2pd
+forwards to the gateway address, which a service listening only on
+`127.0.0.1` never receives. Datagram and raw sessions need 7655/udp, which is
+not published.
 
 ## Threat model
 
@@ -136,8 +143,10 @@ arrive on the container's `eth0`. Exposure on the host is decided only by
   certificates or tunnel definitions. It cannot write the root filesystem,
   and it has no capabilities, no privilege escalation (`no-new-privileges`)
   and bounded memory, PIDs and CPU.
-- **Bandwidth abuse.** Bandwidth class O (about 256 KB/s), a configurable
-  transit share, at most 2,500 transit tunnels, and never floodfill.
+- **Bandwidth abuse.** Bandwidth class O (256 KB/s), a configurable transit
+  share, at most 2,500 transit tunnels, and never floodfill. The class is a
+  target, not a hard cap: above it i2pd refuses new transit tunnels, and your
+  own traffic is never throttled.
 
 **Not protected against:**
 
@@ -170,8 +179,9 @@ manual proxy configuration:
 - HTTP Proxy `127.0.0.1`, port `4444`;
 - enable "Also use this proxy for HTTPS".
 
-The proxy only reaches `.i2p` sites. It has no outproxy and never forwards
-your browser's User-Agent.
+The proxy only reaches `.i2p` sites. It has no outproxy and replaces your
+browser's User-Agent on plain-HTTP requests. HTTPS `.i2p` sites still see it,
+because the proxy only tunnels encrypted bytes for them.
 
 ### Remote server over SSH
 
@@ -221,8 +231,9 @@ I2PD_CONSOLE_BIND_IP=<this-host-lan-ip>
 
 Then run `docker compose up -d`. Each port is published on exactly one
 address, so the console then answers only at `http://<this-host-lan-ip>:7070`
-and returns 403 for any other Host. If you also need the `127.0.0.1` binding,
-add a second port mapping in a local `compose.override.yml`.
+and returns 403 for any other Host. If you also need the proxy or SAM on
+`127.0.0.1`, add a second port mapping in a local `compose.override.yml`. The
+console accepts exactly one hostname, so it cannot answer on both.
 
 ### Tailscale
 
@@ -244,7 +255,9 @@ I2PD_CONSOLE_BIND_IP=<this-host-tailscale-ip>
 
 ## Configuration
 
-All settings are optional and have safe defaults. See `.env.example`.
+All settings are optional and have safe defaults. See `.env.example`. The
+`*_BIND_IP` variables take IPv4 addresses: the console's Host check does not
+handle bracketed IPv6 literals.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -267,6 +280,10 @@ the old placeholder. The entrypoint refuses anything else and says why.
 
 Router settings live in `config/i2pd.conf`. i2pd refuses to start on unknown
 options. Never put the password there, because the entrypoint appends it.
+The console username and hostname and the transit share come from `.env`,
+and the bandwidth class from `docker-compose.yml`. They are passed on the
+command line, which overrides the file, so setting them in `i2pd.conf` has no
+effect.
 Options that carry the security settings (`--conf`, `--datadir`,
 `--certsdir`, `--tunconf`, `--tunnelsdir`, `--http.pass`, `--http.auth`,
 `--http.strictheaders`, `--reseed.verify`) cannot be passed on the command
@@ -350,7 +367,7 @@ line, and relied on the image's defaults inside a writable data directory.
 
    | Setting | Before | After |
    |---|---|---|
-   | Bandwidth class | picked by i2pd: P (up to 2,048 KB/s) on x86_64 hosts with 4+ cores, O on smaller x86_64 hosts, L on ARM | O (up to 256 KB/s) on every host |
+   | Bandwidth class | picked by i2pd: P (2,048 KB/s) on x86_64 hosts with 4+ cores, O on smaller x86_64 hosts, L on ARM | O (256 KB/s transit target) on every host |
    | Transit share | 100% | 50% (`I2PD_SHARE`) |
    | Transit tunnel limit | 25,000 | 2,500 |
    | Reseed signature check | off | on |

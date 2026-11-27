@@ -277,6 +277,7 @@ expect_refusal "-reseed.verify (single dash)" "managed by the entrypoint" "${goo
 expect_refusal "--certsdir as two tokens" "managed by the entrypoint" "${good[@]}" -- -- --certsdir /tmp
 expect_refusal "--share outside 0..100" "--share must be" "${good[@]}" -- -- --share=101
 expect_refusal "SAM published on 0.0.0.0" "all interfaces" "${good[@]}" I2PD_SAM_BIND_IP=0.0.0.0 -- --
+expect_refusal "proxy published on ::ffff:0.0.0.0" "all interfaces" "${good[@]}" I2PD_PROXY_BIND_IP=::ffff:0.0.0.0 -- --
 
 printf 'long-enough-password-123\n' >"$work/unreadable"
 chmod 0600 "$work/unreadable"
