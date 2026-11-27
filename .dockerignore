@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+secrets/
 
 docker-compose.override.yml
 docker-compose.override.yaml

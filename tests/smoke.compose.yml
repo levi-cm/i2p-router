@@ -1,0 +1,6 @@
+# Overlay for tests/smoke.sh: runs the real stack with no network at all.
+# Nothing is published, and i2pd cannot reach reseed servers or peers.
+services:
+  i2pd:
+    network_mode: none
+    ports: !reset []
