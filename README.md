@@ -48,8 +48,9 @@ What each ownership step is for:
   the container user. On the host, `ls -l` may show uid 100 as an unrelated
   system account; that is only a name lookup. i2pd creates its files 0600
   and its directories 0700, so the router keys stay private. If `git status`
-  then warns that it cannot open `i2pd/`, run `sudo chmod 0755 i2pd`: this
-  reveals only the file names.
+  then warns that it cannot open `i2pd/` or `i2pd/.gitkeep`, run
+  `sudo chmod 0755 i2pd && sudo chmod a+r i2pd/.gitkeep`: this reveals only
+  the file names and the empty `.gitkeep`.
 - You keep owner access to the password file, and the container reads it
   through group 65533. To see the password, run `cat secrets/i2pd_http_pass`.
 - `config/` is mounted read-only and must be readable by uid 100. The `chmod`
@@ -73,6 +74,10 @@ the configured hostname (see `I2PD_CONSOLE_HOSTNAME`).
 On first start the router has to reseed (download signed bootstrap data) and
 build tunnels. `docker compose ps` shows `healthy` once the console and SAM are
 up. Give it a few minutes before expecting `.i2p` sites to load reliably.
+The address book downloads its first host list about three minutes after the
+first start, and that first list is short. Until then, and for sites not on
+it, names fail with "Host not found"; use the site's `.b32.i2p` address or a
+jump service.
 
 ### Rootless Podman
 
@@ -414,6 +419,9 @@ sudo ls -la i2pd   # i2pd.conf, tunnels.conf, tunnels.d and certificates are now
 sudo rm -f i2pd/certificates
 # The old image created router.keys world-readable (0644); make old files private.
 sudo find i2pd -mindepth 1 ! -name .gitkeep -exec chmod go-rwx {} +
+# A workaround for the old crash may have made the directory itself writable
+# by everyone, which would let any local user swap the router identity.
+sudo chmod go-w i2pd
 
 # 5. Config readable by the container user.
 chmod -R a+rX config

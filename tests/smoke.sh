@@ -65,14 +65,21 @@ IMAGE=$(docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml"
 echo "image: $IMAGE"
 docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull -q "$IMAGE" >/dev/null
 
+# The tag only names the release; the digest decides what runs. Catches a tag
+# bumped without its digest, or the reverse.
+release=$(sed -n 's/^[^@]*:release-\([^:@]*\)@sha256:[0-9a-f]\{64\}$/\1/p' <<<"$IMAGE")
+version=$(docker run --rm --network none --entrypoint /usr/local/bin/i2pd "$IMAGE" --version 2>&1 || true)
+check "pinned image runs the i2pd release its tag names (release-${release:-?})" \
+    bash -c '[ -n "$1" ] && grep -qF "i2pd version $1 " <<<"$2"' _ "$release" "$version"
+
 work=$(mktemp -d)
 as_root() { # run a shell snippet as root in a throwaway container with $work at /w
     docker run --rm --network none --user 0:0 -v "$work:/w" --entrypoint /bin/sh "$IMAGE" -c "$1"
 }
 cleanup() {
     set +e
-    for p in "$PROJECT" "$PROJECT-reseed" "$PROJECT-neg"; do
-        compose "$p" down --remove-orphans --timeout 5 >/dev/null 2>&1
+    for p in "$PROJECT" "$PROJECT-reseed" "$PROJECT-neg" "$PROJECT-rw" "$PROJECT-user"; do
+        compose "$p" down --remove-orphans --volumes --timeout 5 >/dev/null 2>&1
     done
     as_root 'rm -rf /w/* /w/.[!.]*' >/dev/null 2>&1
     rm -rf "$work"
@@ -96,6 +103,9 @@ new_datadir() { # new_datadir NAME -> owned by 100:65533, like README
 password="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n' | head -c 24)/+=;\"\\x"
 printf '%s\n' "$password" >"$work/pass"
 share_secret pass
+# JSON and YAML escape the quote and backslash, so tools that print escaped
+# text are searched for the random hex part, which survives any escaping.
+needle=${password%%/*}
 new_datadir data
 export I2PD_HTTP_PASS_FILE="$work/pass" I2PD_DATA_DIR="$work/data"
 
@@ -153,6 +163,21 @@ done
 for p in 4447:SOCKS 2827:BOB 7654:I2CP 7650:I2PControl; do
     check "port ${p%%:*} (${p#*:}) is closed" bash -c '! docker exec "$1" nc -z -w 2 127.0.0.1 "$2"' _ "$cid" "${p%%:*}"
 done
+# Exact set, so a service moved to a non-default port is caught too. The router
+# transport (NTCP2 + SSU2) shares one random port on TCP and UDP.
+listeners=$(docker exec "$cid" netstat -ltnu | awk 'NR > 2 { n = split($4, a, ":"); print $1 ":" a[n] }' | sort -u) || true
+transport=$(grep -vxF -e tcp:4444 -e tcp:7070 -e tcp:7656 -e udp:7655 <<<"$listeners" | sed -n 's/^tcp://p' | head -n 1) || true
+expected=$(printf '%s\n' tcp:4444 tcp:7070 tcp:7656 udp:7655 "tcp:$transport" "udp:$transport" | sort -u)
+if [ -n "$transport" ] && [ "$listeners" = "$expected" ]; then
+    pass "listeners are exactly tcp 4444/7070/7656, udp 7655 and transport port $transport"
+else
+    fail "listeners are exactly tcp 4444/7070/7656, udp 7655 and one transport port; got:"
+    printf '%s\n' "$listeners" >&2
+fi
+proxy=$(printf 'GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n' |
+    docker exec -i "$cid" nc -w 5 127.0.0.1 4444) || true
+check "HTTP proxy refuses clearnet (no outproxy)" \
+    bash -c 'head -n 1 <<<"$1" | grep -q "^HTTP/1\.[01] 500" && grep -qF "outproxy is not enabled" <<<"$1"' _ "$proxy"
 published=$(docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" --env-file /dev/null \
     config --format json | jq -c '[.services.i2pd.ports[] | "\(.host_ip):\(.published)/\(.protocol)"] | sort')
 check "only 127.0.0.1 TCP 4444/7070/7656 would be published" \
@@ -165,10 +190,11 @@ check "PID 1 is i2pd (the entrypoint exec'd)" grep -q '^/usr/local/bin/i2pd ' <<
 check "password absent from /proc/1/cmdline" bash -c '! docker exec "$1" cat /proc/1/cmdline | grep -aqF -- "$2"' _ "$cid" "$password"
 check "password absent from /proc/1/environ" bash -c '! docker exec "$1" cat /proc/1/environ | grep -aqF -- "$2"' _ "$cid" "$password"
 check "no password option on the command line" bash -c '! grep -qi "pass" <<<"$1"' _ "$cmdline"
-check "password absent from docker inspect" bash -c '! docker inspect "$1" | grep -qF -- "$2"' _ "$cid" "$password"
+check "password absent from docker inspect" bash -c '! docker inspect "$1" | grep -qF -- "$2"' _ "$cid" "$needle"
 check "password absent from docker compose config" \
     bash -c '! docker compose -p "$1" --project-directory "$2" -f "$2/docker-compose.yml" --env-file /dev/null config | grep -qF -- "$3"' \
-    _ "$PROJECT" "$ROOT" "$password"
+    _ "$PROJECT" "$ROOT" "$needle"
+check "password absent from container logs" bash -c '! docker logs "$1" 2>&1 | grep -qF -- "$2"' _ "$cid" "$needle"
 conf_listing=$(docker exec "$cid" sh -c 'ls -ln /run/i2pd/conf.*/i2pd.conf')
 check "generated config is 0600 and owned by uid 100" grep -Eq '^-rw------- +1 +100 +65533 ' <<<"$conf_listing"
 check "generated config is on tmpfs" \
@@ -186,12 +212,22 @@ check "data directory is writable (positive control)" \
     docker exec "$cid" sh -c 'touch /home/i2pd/data/.probe && rm /home/i2pd/data/.probe'
 status_file=$(docker exec "$cid" cat /proc/1/status)
 check "runs as uid 100 / gid 65533" grep -Eq '^Uid:[[:space:]]+100[[:space:]]+100[[:space:]]+100[[:space:]]+100$' <<<"$status_file"
+check "gid 65533 everywhere and no other groups" \
+    bash -c 'grep -Eq "^Gid:[[:space:]]+65533[[:space:]]+65533[[:space:]]+65533[[:space:]]+65533$" <<<"$1" &&
+        grep -Eq "^Groups:[[:space:]]*65533[[:space:]]*$" <<<"$1"' _ "$status_file"
 check "no effective or bounding capabilities" \
     bash -c 'grep -Eq "^CapEff:[[:space:]]+0+$" <<<"$1" && grep -Eq "^CapBnd:[[:space:]]+0+$" <<<"$1"' _ "$status_file"
 check "no_new_privs is set" grep -Eq '^NoNewPrivs:[[:space:]]+1$' <<<"$status_file"
 check "router identity written to the data directory" docker exec "$cid" test -s /home/i2pd/data/router.keys
+keys_inside=$(docker exec "$cid" sha256sum /home/i2pd/data/router.keys | cut -d ' ' -f 1) || true
 
 compose "$PROJECT" down --timeout 5 >/dev/null 2>&1
+
+# The identity must live in the host directory, not in a volume that a later
+# `down -v` or a moved project would lose.
+keys_host=$(as_root 'sha256sum /w/data/router.keys 2>/dev/null' | cut -d ' ' -f 1) || true
+check "router identity persists in the host data directory after down" \
+    bash -c '[ -n "$1" ] && [ "$1" = "$2" ]' _ "$keys_inside" "$keys_host"
 
 # --- Reseed signature verification (offline) --------------------------------------------------
 # A forged SU3 naming a signer whose certificate ships in the image must be
@@ -244,12 +280,29 @@ expect_refusal() { # expect_refusal "description" "expected message" [VAR=value.
     out=$(env "${envs[@]}" docker compose -p "$PROJECT-neg" --project-directory "$ROOT" \
         -f "$ROOT/docker-compose.yml" -f "$ROOT/tests/smoke.compose.yml" --env-file /dev/null \
         run --rm --no-deps "${runargs[@]}" i2pd "${args[@]}" 2>&1) || rc=$?
-    if [ "$rc" -ne 0 ] && grep -qF -- "$expected" <<<"$out" && ! grep -q 'i2pd v[0-9]' <<<"$out"; then
-        pass "refuses: $desc"
+    refusal_result "$desc" "$expected" "$rc" "$out"
+}
+refusal_result() { # refusal_result "description" "expected message" EXIT_CODE OUTPUT
+    if [ "$3" -ne 0 ] && grep -qF -- "$2" <<<"$4" && ! grep -q 'i2pd v[0-9]' <<<"$4"; then
+        pass "refuses: $1"
     else
-        fail "refuses: $desc (exit $rc)"
-        printf '%s\n' "$out" | tail -n 5 >&2
+        fail "refuses: $1 (exit $3)"
+        printf '%s\n' "$4" | tail -n 5 >&2
     fi
+}
+# Guards that fire before the secret is read run the entrypoint without Compose
+# or a secret: if a guard stops refusing, the entrypoint fails on the missing
+# secret within a second instead of starting i2pd and hanging the test.
+expect_early_refusal() { # expect_early_refusal "description" "expected message" [VAR=value...] -- [i2pd args...]
+    local desc=$1 expected=$2
+    shift 2
+    local -a envs=()
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=(-e "$1"); shift; done
+    [ $# -gt 0 ] && shift
+    local out rc=0
+    out=$(docker run --rm --network none --read-only --user 100:65533 "${envs[@]}" \
+        -v "$ROOT/config:/etc/i2pd:ro" --entrypoint /bin/sh "$IMAGE" /etc/i2pd/entrypoint.sh "$@" 2>&1) || rc=$?
+    refusal_result "$desc" "$expected" "$rc" "$out"
 }
 
 new_datadir data-neg
@@ -278,6 +331,15 @@ expect_refusal "--certsdir as two tokens" "managed by the entrypoint" "${good[@]
 expect_refusal "--share outside 0..100" "--share must be" "${good[@]}" -- -- --share=101
 expect_refusal "SAM published on 0.0.0.0" "all interfaces" "${good[@]}" I2PD_SAM_BIND_IP=0.0.0.0 -- --
 expect_refusal "proxy published on ::ffff:0.0.0.0" "all interfaces" "${good[@]}" I2PD_PROXY_BIND_IP=::ffff:0.0.0.0 -- --
+expect_early_refusal "console published on 0.0.0.0" "all interfaces" I2PD_CONSOLE_BIND_IP=0.0.0.0 --
+expect_early_refusal "proxy published on [::]" "all interfaces" "I2PD_PROXY_BIND_IP=[::]" --
+expect_early_refusal "SAM published on [::0]" "all interfaces" "I2PD_SAM_BIND_IP=[::0]" --
+expect_early_refusal "--conf on the command line" "managed by the entrypoint" -- --conf=/tmp/i2pd.conf
+expect_early_refusal "--datadir as two tokens" "managed by the entrypoint" -- --datadir /tmp
+expect_early_refusal "-tunconf (single dash)" "managed by the entrypoint" -- -tunconf=/tmp/tunnels.conf
+expect_early_refusal "--tunnelsdir on the command line" "managed by the entrypoint" -- --tunnelsdir=/tmp
+expect_early_refusal "--http.auth on the command line" "managed by the entrypoint" -- --http.auth=false
+expect_early_refusal "--http.strictheaders on the command line" "managed by the entrypoint" -- --http.strictheaders=false
 
 printf 'long-enough-password-123\n' >"$work/unreadable"
 chmod 0600 "$work/unreadable"
@@ -295,6 +357,65 @@ legacy_out=$(env "${neg[@]}" I2PD_HTTP_PASS_FILE="$work/legacyshort" I2PD_BIND_I
 check "warns about legacy I2PD_BIND_IP" grep -q 'I2PD_BIND_IP is set but no longer used' <<<"$legacy_out"
 check "warns about legacy I2PD_HTTP_PASS" grep -q 'I2PD_HTTP_PASS is set but ignored' <<<"$legacy_out"
 check "legacy password value never reaches the container" bash -c '! grep -qF legacy-password-value-1234 <<<"$1"' _ "$legacy_out"
+
+# --- Writable config versus read-only mount ----------------------------------------------------
+# The trust check must test real writability, not permission bits: config/
+# owned by the container uid is refused when mounted read-write and accepted
+# read-only (the README's no-sudo path). Both run detached with a bounded wait,
+# so an entrypoint that stops refusing cannot hang the test.
+
+wait_stopped() { # wait_stopped CONTAINER SECONDS
+    local deadline=$((SECONDS + $2))
+    while [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; do
+        [ $SECONDS -lt $deadline ] || return 1
+        sleep 1
+    done
+}
+
+cp -a config "$work/config-rw"
+as_root 'chown -R 100:65533 /w/config-rw'
+cat >"$work/config-rw.yml" <<EOF
+services:
+  i2pd:
+    volumes: !override
+      - "$work/data-neg:/home/i2pd/data"
+      - "$work/config-rw:/etc/i2pd"
+EOF
+env "${good[@]}" docker compose -p "$PROJECT-rw" --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" \
+    -f "$ROOT/tests/smoke.compose.yml" -f "$work/config-rw.yml" --env-file /dev/null \
+    run -d --no-deps --name "$PROJECT-rw" i2pd >/dev/null
+wait_stopped "$PROJECT-rw" 30 || true
+refusal_result "config/ mounted read-write" "is writable by uid" \
+    "$(docker inspect -f '{{.State.ExitCode}}' "$PROJECT-rw")" "$(docker logs "$PROJECT-rw" 2>&1)"
+docker rm -f "$PROJECT-rw" >/dev/null 2>&1
+
+rootless_engine() { # Docker, then Podman
+    docker info -f '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless ||
+        docker info -f '{{.Host.Security.Rootless}}' 2>/dev/null | grep -qx true
+}
+me="$(id -u):$(id -g)"
+if [ "${me%%:*}" -eq 0 ]; then
+    echo "skip  I2PD_USER=<own uid:gid> start: running as root, which the entrypoint refuses by design"
+elif rootless_engine; then
+    echo "skip  I2PD_USER=<own uid:gid> start: a rootless engine maps host uids to other container uids"
+else
+    mkdir -m 0700 "$work/data-user"
+    I2PD_USER=$me I2PD_DATA_DIR="$work/data-user" I2PD_HTTP_PASS_FILE="$work/pass" \
+        compose "$PROJECT-user" run -d --no-deps --name "$PROJECT-user" i2pd >/dev/null
+    deadline=$((SECONDS + 20))
+    user_cmdline=
+    until grep -q '^/usr/local/bin/i2pd ' <<<"$user_cmdline" || [ $SECONDS -ge $deadline ]; do
+        sleep 1
+        user_cmdline=$(docker exec "$PROJECT-user" cat /proc/1/cmdline 2>/dev/null | tr '\0' ' ') || true
+    done
+    if grep -q '^/usr/local/bin/i2pd ' <<<"$user_cmdline"; then
+        pass "starts as I2PD_USER=$me with config/ read-only (README no-sudo path)"
+    else
+        fail "starts as I2PD_USER=$me with config/ read-only (README no-sudo path)"
+        docker logs "$PROJECT-user" 2>&1 | tail -n 5 >&2
+    fi
+    docker rm -f "$PROJECT-user" >/dev/null 2>&1
+fi
 
 echo
 if [ "$failures" -ne 0 ]; then

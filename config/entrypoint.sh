@@ -34,6 +34,17 @@ die() {
     log "ERROR: $*"
     exit 1
 }
+# busybox `test -w` looks only at permission bits and misses read-only mounts,
+# so try a real write: create and remove a probe file in a directory, or open
+# a file for appending without writing to it. Use only in conditions.
+can_write() {
+    if [ -d "$1" ]; then
+        probe=$(mktemp "$1/.write-probe.XXXXXX" 2>/dev/null) || return 1
+        rm -f "$probe"
+    else
+        (: >>"$1") 2>/dev/null
+    fi
+}
 
 uid=$(id -u)
 gid=$(id -g)
@@ -182,14 +193,14 @@ fi
 ls "$CERTS_DIR"/reseed/*.crt >/dev/null 2>&1 || die "no reseed certificates in $CERTS_DIR/reseed."
 
 for path in "$BASE_CONF" "${BASE_CONF%/*}" "$CERTS_DIR" "$CERTS_DIR/reseed" "$TUNNELS_CONF" "$TUNNELS_DIR"; do
-    if [ -e "$path" ] && [ -w "$path" ]; then
+    if [ -e "$path" ] && can_write "$path"; then
         die "$path is writable by uid $uid. Keep read_only: true and mount config/ read-only."
     fi
 done
 
 # --- Data directory ---------------------------------------------------------------
 
-if [ ! -w "$DATA_DIR" ]; then
+if ! can_write "$DATA_DIR"; then
     die "the data directory is not writable by uid $uid gid $gid, so i2pd cannot store" \
         "its router identity. On the host run: sudo chown -R $uid:$gid ./i2pd" \
         "(rootless Podman: podman unshare chown -R $uid:$gid ./i2pd)."
@@ -209,7 +220,7 @@ done
 # --- Effective config on tmpfs ------------------------------------------------------
 
 runtime_fs=$(awk -v dir="$RUNTIME_DIR" '$2 == dir { fs = $3 } END { print fs }' /proc/mounts)
-if [ "$runtime_fs" != tmpfs ] || [ ! -w "$RUNTIME_DIR" ]; then
+if [ "$runtime_fs" != tmpfs ] || ! can_write "$RUNTIME_DIR"; then
     die "$RUNTIME_DIR must be a writable tmpfs so the password never touches disk."
 fi
 

@@ -73,8 +73,8 @@ jqcheck "entrypoint sees loopback bind addresses by default" "$M" \
     "$S.environment | .I2PD_PROXY_BIND_IP == \"127.0.0.1\" and .I2PD_CONSOLE_BIND_IP == \"127.0.0.1\" and .I2PD_SAM_BIND_IP == \"127.0.0.1\""
 jqcheck "console hostname defaults to 127.0.0.1" "$M" \
     "$S.command | index(\"--http.hostname=127.0.0.1\") != null"
-jqcheck "no host networking, no extra namespaces" "$M" \
-    "($S.network_mode // \"\") != \"host\" and ($S.pid // \"\") != \"host\" and ($S.ipc // \"\") != \"host\""
+jqcheck "no host networking, no shared namespaces" "$M" \
+    "[$S | .network_mode, .pid, .ipc, .userns_mode, .uts, .cgroup] | all(. == null)"
 
 for svc in PROXY:4444 CONSOLE:7070 SAM:7656; do
     name=${svc%%:*}
@@ -84,6 +84,11 @@ for svc in PROXY:4444 CONSOLE:7070 SAM:7656; do
         "all($S.ports[]; if .target == $port then .host_ip == \"192.0.2.10\" else .host_ip == \"127.0.0.1\" end)
          and $S.environment.I2PD_${name}_BIND_IP == \"192.0.2.10\""
 done
+# Set but empty, as a blank line in .env does. ${VAR-default} would publish on all interfaces.
+render I2PD_PROXY_BIND_IP= I2PD_CONSOLE_BIND_IP= I2PD_SAM_BIND_IP= >"$work/empty-bind.json"
+jqcheck "empty bind variables fall back to 127.0.0.1" "$work/empty-bind.json" \
+    "all($S.ports[]; .host_ip == \"127.0.0.1\")
+     and ($S.environment | .I2PD_PROXY_BIND_IP == \"127.0.0.1\" and .I2PD_CONSOLE_BIND_IP == \"127.0.0.1\" and .I2PD_SAM_BIND_IP == \"127.0.0.1\")"
 render I2PD_CONSOLE_BIND_IP=192.0.2.10 >"$work/console.json"
 jqcheck "console hostname follows I2PD_CONSOLE_BIND_IP" "$work/console.json" \
     "$S.command | index(\"--http.hostname=192.0.2.10\") != null"
@@ -128,13 +133,18 @@ check "config/i2pd.conf does not set a password" \
 jqcheck "runs as 100:65533 by default" "$M" "$S.user == \"100:65533\""
 jqcheck "read-only root filesystem" "$M" "$S.read_only == true"
 jqcheck "all capabilities dropped, none added" "$M" "$S.cap_drop == [\"ALL\"] and (($S.cap_add // []) | length == 0)"
-jqcheck "no-new-privileges" "$M" "$S.security_opt | index(\"no-new-privileges:true\") != null"
+jqcheck "security_opt is exactly no-new-privileges (no unconfined profiles)" "$M" \
+    "$S.security_opt == [\"no-new-privileges:true\"]"
 jqcheck "not privileged, no devices" "$M" "($S.privileged // false) == false and (($S.devices // []) | length == 0)"
+jqcheck "no supplementary groups" "$M" "($S.group_add // []) | length == 0"
 jqcheck "noexec tmpfs on /tmp and /run/i2pd" "$M" \
     "[$S.tmpfs[] | select(test(\"^/(tmp|run/i2pd):\") and test(\"noexec\") and test(\"nosuid\") and test(\"size=\"))] | length == 2"
 jqcheck "memory, PID and CPU limits set" "$M" \
     "(($S.mem_limit // 0) | tonumber) > 0 and ($S.pids_limit // 0) > 0 and (($S.cpus // 0) | tonumber) > 0"
 jqcheck "entrypoint is the mounted script" "$M" "$S.entrypoint == [\"/bin/sh\", \"/etc/i2pd/entrypoint.sh\"]"
+# Command-line options override i2pd.conf, so this list is the only guard against them.
+jqcheck "command is exactly the four default options" "$M" \
+    "$S.command == [\"--http.user=i2pd\", \"--http.hostname=127.0.0.1\", \"--bandwidth=O\", \"--share=50\"]"
 jqcheck "bandwidth O with a share" "$M" \
     "($S.command | index(\"--bandwidth=O\") != null) and ($S.command | any(test(\"^--share=[0-9]+$\")))"
 jqcheck "healthcheck needs a 401 from the console and a SAM HELLO reply" "$M" \
@@ -146,8 +156,36 @@ jqcheck "config/ is mounted read-only at /etc/i2pd" "$M" \
     "any($S.volumes[]; .target == \"/etc/i2pd\" and .read_only == true and (.source | endswith(\"/config\")))"
 jqcheck "data directory is the only writable mount" "$M" \
     "[$S.volumes[] | select((.read_only // false) | not) | .target] == [\"/home/i2pd/data\"]"
+# A named volume here would silently give upgraders a new router identity.
+jqcheck "data directory is a bind mount of ./i2pd by default" "$M" \
+    "[$S.volumes[] | select(.target == \"/home/i2pd/data\") | {type, source}] == [{type: \"bind\", source: (\$root + \"/i2pd\")}]" \
+    --arg root "$ROOT"
+render I2PD_DATA_DIR=/srv/i2pd-test >"$work/datadir.json"
+jqcheck "I2PD_DATA_DIR moves the data bind mount" "$work/datadir.json" \
+    "[$S.volumes[] | select(.target == \"/home/i2pd/data\") | {type, source}] == [{type: \"bind\", source: \"/srv/i2pd-test\"}]"
 jqcheck "no Docker socket or host root mounted" "$M" \
     "all($S.volumes[]; (.source // \"\") as \$s | (\$s | test(\"docker\\\\.sock\") | not) and \$s != \"/\")"
+
+# --- i2pd.conf --------------------------------------------------------------------
+
+# One section.key=value line per setting, parsed as i2pd does: '#' starts a
+# comment anywhere, whitespace around names and values is ignored, and keys
+# before the first [section] have no prefix.
+awk '{ sub(/#.*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, "") }
+    $0 == "" { next }
+    /^\[.*\]$/ { s = substr($0, 2, length($0) - 2); gsub(/[[:space:]]/, "", s); s = s "."; next }
+    { k = $0; sub(/[[:space:]]*=.*/, "", k); v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); print s k "=" v }' \
+    config/i2pd.conf >"$work/conf.kv"
+conf_is() { # conf_is key value: key is set exactly once, to value
+    [ "$(awk -F= -v k="$1" '$1 == k { print substr($0, length(k) + 2) }' "$work/conf.kv")" = "$2" ]
+}
+for pin in floodfill=false ipv4=true ipv6=false upnp.enabled=false reseed.verify=true \
+    http.auth=true http.strictheaders=true httpproxy.senduseragent=false socksproxy.enabled=false \
+    bob.enabled=false i2cp.enabled=false i2pcontrol.enabled=false \
+    limits.transittunnels=2500 limits.openfiles=4096; do
+    check "i2pd.conf sets $pin" conf_is "${pin%%=*}" "${pin#*=}"
+done
+check "i2pd.conf sets no outproxy" bash -c '! grep -q "^[^=]*outproxy[^=]*=" "$1"' _ "$work/conf.kv"
 
 # --- Image pin ---------------------------------------------------------------------
 
