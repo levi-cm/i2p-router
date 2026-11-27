@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+secrets/
 
 # Local Compose overrides often contain host IPs or private paths.
 docker-compose.override.yml
@@ -14,6 +15,10 @@ compose.override.yaml
 i2pd/*
 !i2pd/
 !i2pd/.gitkeep
+
+# Local tunnel definitions, read from the read-only config mount.
+config/tunnels.conf
+config/tunnels.d/
 
 # Editor and OS noise.
 .DS_Store

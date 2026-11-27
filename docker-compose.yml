@@ -1,39 +1,68 @@
+# Hardened i2pd router. Every published port is bound to 127.0.0.1 unless you
+# opt in per service in .env. Read README.md before exposing anything.
+
 services:
   i2pd:
-    image: "${I2PD_IMAGE:-purplei2p/i2pd:release-2.60.0@sha256:7e2485270d274d9eaaa6240f8aaeac155b3af79967f44d1ba474c242a3653adb}"
+    image: "${I2PD_IMAGE:-purplei2p/i2pd:release-3.0.0@sha256:1cca4e8ef3717c351995f0c1d562ca70b6dd1352e3decf75e25a837572b7e2e4}"
     restart: unless-stopped
+    # The image's i2pd user. The data directory must be owned by this uid:gid.
+    user: "${I2PD_USER:-100:65533}"
+    entrypoint: ["/bin/sh", "/etc/i2pd/entrypoint.sh"]
+    command:
+      - "--http.user=${I2PD_HTTP_USER:-i2pd}"
+      # The console answers 403 unless the Host header is this name or address.
+      - "--http.hostname=${I2PD_CONSOLE_HOSTNAME:-${I2PD_CONSOLE_BIND_IP:-127.0.0.1}}"
+      - "--bandwidth=O"
+      # Percent of the bandwidth limit offered to transit traffic. 0 = no transit.
+      - "--share=${I2PD_SHARE:-50}"
+    environment:
+      # Published addresses, so the entrypoint can refuse wildcard binds.
+      I2PD_PROXY_BIND_IP: "${I2PD_PROXY_BIND_IP:-127.0.0.1}"
+      I2PD_CONSOLE_BIND_IP: "${I2PD_CONSOLE_BIND_IP:-127.0.0.1}"
+      I2PD_SAM_BIND_IP: "${I2PD_SAM_BIND_IP:-127.0.0.1}"
+      # "1" when a removed setting is still in .env. The values are never passed.
+      I2PD_LEGACY_BIND_IP_SET: "${I2PD_BIND_IP:+1}"
+      I2PD_LEGACY_HTTP_PASS_SET: "${I2PD_HTTP_PASS:+1}"
+    secrets:
+      - i2pd_http_pass
+    volumes:
+      # Router identity and state. The only writable bind mount.
+      - "${I2PD_DATA_DIR:-./i2pd}:/home/i2pd/data"
+      # i2pd.conf and entrypoint.sh (plus optional tunnels.conf / tunnels.d).
+      - "./config:/etc/i2pd:ro"
     read_only: true
     tmpfs:
-      - /tmp:rw,noexec,nosuid,size=16m
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+      # Holds the generated config with the console password.
+      - /run/i2pd:rw,noexec,nosuid,nodev,size=1m,mode=1777
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
-    command:
-      - "--http.enabled=true"
-      - "--http.address=0.0.0.0"
-      - "--http.port=7070"
-      - "--http.auth=true"
-      - "--http.user=${I2PD_HTTP_USER:-i2pd}"
-      - "--http.pass=${I2PD_HTTP_PASS:?Set I2PD_HTTP_PASS in .env before starting}"
-      - "--http.hostname=${I2PD_BIND_IP:?Set I2PD_BIND_IP to this host's LAN IP in .env before starting}"
-      - "--httpproxy.enabled=true"
-      - "--httpproxy.address=0.0.0.0"
-      - "--httpproxy.port=4444"
-      - "--sam.enabled=true"
-      - "--sam.address=0.0.0.0"
-      - "--sam.port=7656"
-    volumes:
-      - ./i2pd:/home/i2pd/data
+    mem_limit: "${I2PD_MEM_LIMIT:-512m}"
+    pids_limit: ${I2PD_PIDS_LIMIT:-256}
+    cpus: ${I2PD_CPUS:-1.0}
     healthcheck:
+      # Healthy only if the console demands credentials and SAM answers HELLO.
       test:
         - CMD-SHELL
-        - 'printf "GET / HTTP/1.0\r\n\r\n" | nc -w 2 127.0.0.1 7070 | grep -q "^HTTP/1\.[01] 401"'
-      interval: 30s
-      timeout: 5s
+        - >-
+          printf 'GET / HTTP/1.0\r\n\r\n' | nc -w 3 127.0.0.1 7070 | head -n 1 | grep -q '^HTTP/1\.[01] 401'
+          && printf 'HELLO VERSION MIN=3.0 MAX=3.3\n' | nc -w 3 127.0.0.1 7656 | grep -q '^HELLO REPLY RESULT=OK'
+      # Each probe logs one auth failure and one SAM read error, so keep it slow.
+      interval: 60s
+      timeout: 10s
       retries: 3
-      start_period: 30s
+      # i2pd opens the console and SAM only after its first reseed attempt.
+      start_period: 120s
     ports:
-      - "${I2PD_BIND_IP:?Set I2PD_BIND_IP to this host's LAN IP in .env before starting}:4444:4444"
-      - "${I2PD_BIND_IP:?Set I2PD_BIND_IP to this host's LAN IP in .env before starting}:7070:7070"
-      - "${I2PD_BIND_IP:?Set I2PD_BIND_IP to this host's LAN IP in .env before starting}:7656:7656"
+      # HTTP proxy, no authentication.
+      - "${I2PD_PROXY_BIND_IP:-127.0.0.1}:4444:4444"
+      # Web console, HTTP Basic auth over plain HTTP.
+      - "${I2PD_CONSOLE_BIND_IP:-127.0.0.1}:7070:7070"
+      # SAM bridge, no authentication. Roughly shell-level access.
+      - "${I2PD_SAM_BIND_IP:-127.0.0.1}:7656:7656"
+
+secrets:
+  i2pd_http_pass:
+    file: "${I2PD_HTTP_PASS_FILE:-./secrets/i2pd_http_pass}"
