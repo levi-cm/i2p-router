@@ -36,13 +36,17 @@ die() {
 }
 # busybox `test -w` looks only at permission bits and misses read-only mounts,
 # so try a real write: create and remove a probe file in a directory, or open
-# a file for appending without writing to it. Use only in conditions.
+# a regular file for appending without writing to it. Anything else (a FIFO
+# would block the open, a device ignores the mount) counts as writable, so
+# the trust check refuses it. Use only in conditions.
 can_write() {
     if [ -d "$1" ]; then
         probe=$(mktemp "$1/.write-probe.XXXXXX" 2>/dev/null) || return 1
-        rm -f "$probe"
-    else
+        rm -f "$probe" || :
+    elif [ -f "$1" ]; then
         (: >>"$1") 2>/dev/null
+    else
+        [ -e "$1" ]
     fi
 }
 

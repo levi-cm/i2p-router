@@ -78,6 +78,8 @@ as_root() { # run a shell snippet as root in a throwaway container with $work at
 }
 cleanup() {
     set +e
+    # `compose down` leaves one-off `run -d` containers behind.
+    docker rm -f "$PROJECT-reseed" "$PROJECT-rw" "$PROJECT-user" >/dev/null 2>&1
     for p in "$PROJECT" "$PROJECT-reseed" "$PROJECT-neg" "$PROJECT-rw" "$PROJECT-user"; do
         compose "$p" down --remove-orphans --volumes --timeout 5 >/dev/null 2>&1
     done
