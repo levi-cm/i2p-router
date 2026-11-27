@@ -3,7 +3,7 @@
 
 services:
   i2pd:
-    image: "${I2PD_IMAGE:-purplei2p/i2pd:release-2.60.0@sha256:7e2485270d274d9eaaa6240f8aaeac155b3af79967f44d1ba474c242a3653adb}"
+    image: "${I2PD_IMAGE:-purplei2p/i2pd:release-3.0.0@sha256:1cca4e8ef3717c351995f0c1d562ca70b6dd1352e3decf75e25a837572b7e2e4}"
     restart: unless-stopped
     # The image's i2pd user. The data directory must be owned by this uid:gid.
     user: "${I2PD_USER:-100:65533}"

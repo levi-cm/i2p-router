@@ -279,7 +279,7 @@ your tunnels reference are stored in `./i2pd`.
 
 ## Updating the i2pd image
 
-The default image is pinned to `purplei2p/i2pd:release-2.60.0` by its
+The default image is pinned to `purplei2p/i2pd:release-3.0.0` by its
 multi-platform index digest. To move to a new release:
 
 1. Read the release notes at <https://github.com/PurpleI2P/i2pd/releases>.
@@ -355,6 +355,7 @@ line, and relied on the image's defaults inside a writable data directory.
    | Transit tunnel limit | 25,000 | 2,500 |
    | Reseed signature check | off | on |
    | SOCKS proxy (inside the container only) | on | off |
+   | i2pd version | 2.60.0 | 3.0.0: SSU2 defaults to post-quantum ML-KEM-768 (`ssu2.version` 4), refreshed reseed servers, key files created owner-only |
 
    Floodfill, UPnP, IPv6, the outproxy and User-Agent forwarding stay off,
    now set explicitly. BOB, I2CP and I2PControl stay disabled.
